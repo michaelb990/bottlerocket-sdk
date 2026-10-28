@@ -1,0 +1,70 @@
+#!/bin/bash
+#
+# Sign every unsigned kernel module in the buildroot with the kit module-signing
+# key.
+
+set -euo pipefail
+
+for opt in "$@"; do
+   optarg="$(expr "${opt}" : '[^=]*=\(.*\)')"
+   case "${opt}" in
+      --target=*) TARGET="${optarg}" ;;
+      --key=*) KEY="${optarg}" ;;
+   esac
+done
+
+OBJCOPY="${TARGET}-objcopy"
+MARKER='~Module signature appended~'
+work="$(mktemp -d)"
+trap 'rm -rf "${work}"' EXIT
+
+is_signed() {
+  tail -c 28 "${1:?}" | cmp -s - <(printf '%s\n' "${MARKER}")
+}
+
+# Never sign a module whose license the kernel doesn't treat as GPL-compatible
+# (include/linux/license.h).
+check_license() {
+  local ko license
+  ko="${1:?}"
+  "${OBJCOPY}" -O binary --only-section=.modinfo "${ko}" "${work}/modinfo"
+  license="$(tr '\0' '\n' < "${work}/modinfo" | sed -n 's/^license=//p')"
+  case "${license}" in
+    "GPL"|"GPL v2"|"GPL and additional rights"|"Dual BSD/GPL"|"Dual MIT/GPL"|"Dual MPL/GPL") ;;
+    *)
+      echo "error: ${ko#"${RPM_BUILD_ROOT}"} declares license '${license}', which is not GPL-compatible, so the kit module-signing key must not sign it" >&2
+      exit 1
+      ;;
+  esac
+}
+
+# The kernel's module signature format, as scripts/sign-file writes it: the
+# PKCS#7 signature, struct module_signature (id_type PKEY_ID_PKCS7, big-endian
+# signature length) and the marker.
+sign() {
+  local ko len
+  ko="${1:?}"
+  openssl cms -sign -binary -noattr -nosmimecap -nocerts -md sha512 \
+    -outform DER -signer "${KEY}" -inkey "${KEY}" \
+    -in "${ko}" -out "${work}/sig"
+  len="$(stat -c %s "${work}/sig")"
+  {
+    cat "${work}/sig"
+    printf '\x00\x00\x02\x00\x00\x00\x00\x00'
+    printf "$(printf '\\x%02x\\x%02x\\x%02x\\x%02x' \
+      $((len >> 24 & 255)) $((len >> 16 & 255)) $((len >> 8 & 255)) $((len & 255)))"
+    printf '%s\n' "${MARKER}"
+  } >> "${ko}"
+}
+
+signed=0
+while IFS= read -r -d '' ko; do
+  if is_signed "${ko}"; then
+    continue
+  fi
+  check_license "${ko}"
+  sign "${ko}"
+  signed=$((signed + 1))
+done < <(find "${RPM_BUILD_ROOT}" -type f -name '*.ko' -print0 | sort -z)
+
+echo "signed ${signed} kernel modules with the kit module-signing key"
